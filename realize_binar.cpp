@@ -4,14 +4,18 @@
 #include <string>
 #include <ctime>
 #include <cstring>
+#include <stdexcept>
 #include "info_binar.h"
 #include <fstream>
 
+
+#define PAGE_FILE_SIZE (16 + sizeof(Cell) * ELEM_SIZE)
+
 FileSystem::FileSystem(const char* filename_, long sizeArry) {
   arraySize = sizeArry;
-  pageCount = (arraySize * sizeof(int) + PAGE_SIZE - 1) / PAGE_SIZE;
+  pageCount = (arraySize + ELEM_SIZE - 1) / ELEM_SIZE;
 
-  // Сначала инициализируем буфер — до любых load_Page вызовов
+
   for (int i = 0; i < BUFF_SIZE; i++) {
     buffer[i].PageNum          = -1;
     buffer[i].flag_modification = 0;
@@ -31,17 +35,27 @@ FileSystem::FileSystem(const char* filename_, long sizeArry) {
     }
 
     FileHead header = {{'V', 'M'}, 'I', sizeArry};
-    fwrite(&header, sizeof(header), 1, file);
-
-    uint8_t nuli[16 + PAGE_SIZE] = {};
-    for (long p = 0; p < pageCount; p++) {
-      fwrite(nuli, 1, sizeof(nuli), file);
+    if (fwrite(&header, sizeof(header), 1, file) != 1) {
+      std::cout << "Ошибка: не удалось записать заголовок файла!\n";
+      fclose(file);
+      file = nullptr;
+      return;
     }
-    // Сбрасываем буфер записи на диск
+
+
+    std::vector<uint8_t> nuli(PAGE_FILE_SIZE, 0);
+    for (long p = 0; p < pageCount; p++) {
+      if (fwrite(nuli.data(), 1, PAGE_FILE_SIZE, file) != PAGE_FILE_SIZE) {
+        std::cout << "Ошибка: не удалось инициализировать страницы файла!\n";
+        fclose(file);
+        file = nullptr;
+        return;
+      }
+    }
+
     fflush(file);
   }
 
-  // Загружаем первые BUFF_SIZE страниц в буфер
   for (int i = 0; i < BUFF_SIZE && i < pageCount; i++) {
     load_Page(i, i);
   }
@@ -59,30 +73,45 @@ long FileSystem::get_PageNum(long id) {
 }
 
 long FileSystem::page_offset(long Pagenum) {
-  return sizeof(FileHead) + (Pagenum * (16 + PAGE_SIZE));
+  return sizeof(FileHead) + (Pagenum * PAGE_FILE_SIZE);
 }
 
 void FileSystem::write_PageFile(int slot) {
-  // Не пишем пустые слоты (PageNum == -1)
   if (buffer[slot].PageNum == -1) return;
   if (!buffer[slot].flag_modification) return;
 
   long offset = page_offset(buffer[slot].PageNum);
-  fseek(file, offset, SEEK_SET);
-
-  fwrite(buffer[slot].bitmap, 1, 16, file);
-  fwrite(buffer[slot].data, sizeof(int), ELEM_SIZE, file);
-  fflush(file); // гарантируем что данные реально ушли на диск
+  if (fseek(file, offset, SEEK_SET) != 0) {
+    std::cout << "Ошибка: не удалось позиционироваться в файле при записи!\n";
+    return;
+  }
+  if (fwrite(buffer[slot].bitmap, 1, 16, file) != 16) {
+    std::cout << "Ошибка: не удалось записать битовую карту на диск!\n";
+    return;
+  }
+  if (fwrite(buffer[slot].data, sizeof(Cell), ELEM_SIZE, file) != (size_t)ELEM_SIZE) {
+    std::cout << "Ошибка: не удалось записать данные страницы на диск!\n";
+    return;
+  }
+  fflush(file);
 
   buffer[slot].flag_modification = 0;
 }
 
 void FileSystem::load_Page(int slot, long Pagenum) {
   long offset = page_offset(Pagenum);
-  fseek(file, offset, SEEK_SET);
-
-  fread(buffer[slot].bitmap, 1, 16, file);
-  fread(buffer[slot].data, sizeof(int), ELEM_SIZE, file);
+  if (fseek(file, offset, SEEK_SET) != 0) {
+    std::cout << "Ошибка: не удалось позиционироваться в файле при загрузке!\n";
+    return;
+  }
+  if (fread(buffer[slot].bitmap, 1, 16, file) != 16) {
+    std::cout << "Ошибка: не удалось прочитать битовую карту с диска!\n";
+    return;
+  }
+  if (fread(buffer[slot].data, sizeof(Cell), ELEM_SIZE, file) != (size_t)ELEM_SIZE) {
+    std::cout << "Ошибка: не удалось прочитать данные страницы с диска!\n";
+    return;
+  }
 
   buffer[slot].flag_modification = 0;
   buffer[slot].PageTime          = time(nullptr);
@@ -92,12 +121,12 @@ void FileSystem::load_Page(int slot, long Pagenum) {
 int FileSystem::find_slot(long id) {
   long pageNum = get_PageNum(id);
 
-  // 1. Ищем страницу которая уже в буфере
+
   for (int i = 0; i < BUFF_SIZE; i++) {
     if (buffer[i].PageNum == pageNum) return i;
   }
 
-  // 2. Страницы нет — ищем самый старый слот для вытеснения
+
   int oldest = 0;
   for (int i = 1; i < BUFF_SIZE; i++) {
     if (buffer[i].PageTime < buffer[oldest].PageTime) {
@@ -105,12 +134,12 @@ int FileSystem::find_slot(long id) {
     }
   }
 
-  // 3. Если слот был изменён — сначала сохраняем на диск
+
   if (buffer[oldest].flag_modification) {
     write_PageFile(oldest);
   }
 
-  // 4. Загружаем нужную страницу
+
   load_Page(oldest, pageNum);
   return oldest;
 }
@@ -124,32 +153,53 @@ bool FileSystem::set_bit(uint8_t* bitmap, int pos) {
   return true;
 }
 
-bool FileSystem::read(long id, int& value) {
-  if (id < 0 || id >= arraySize) return false;
+bool FileSystem::read(long id, int& value, std::vector<int>& history, int& fl_mod) {
+  if (id < 0 || id >= arraySize) {
+    throw std::out_of_range("Индекс вне диапазона");
+  }
 
   int slot = find_slot(id);
   int off  = get_elemFile(id);
 
-  if (!get_bit(buffer[slot].bitmap, off)) {
-    value = 0;
+  Cell& cell = buffer[slot].data[off];
+
+  if (!get_bit(buffer[slot].bitmap, off) || cell.count == 0) {
+    value  = 0;
+    fl_mod = 0;
+    history.clear();
   } else {
-    value = buffer[slot].data[off];
+    value  = cell.history[cell.count - 1];
+    fl_mod = cell.flag_modification;
+    history.assign(cell.history, cell.history + cell.count);
   }
 
   return true;
 }
 
 bool FileSystem::write(long id, int value) {
-  if (id < 0 || id >= arraySize) return false;
+  if (id < 0 || id >= arraySize) {
+    throw std::out_of_range("Индекс вне диапазона");
+  }
 
   int slot = find_slot(id);
   int off  = get_elemFile(id);
 
-  buffer[slot].data[off] = value;
-  set_bit(buffer[slot].bitmap, off);
+  Cell& cell = buffer[slot].data[off];
 
+  if (cell.count < HISTORY_SIZE) {
+    cell.history[cell.count] = value;
+    cell.count++;
+  } else {
+    for (int i = 0; i < HISTORY_SIZE - 1; i++) {
+      cell.history[i] = cell.history[i + 1];
+    }
+    cell.history[HISTORY_SIZE - 1] = value;
+  }
+
+  cell.flag_modification = 1;
+  set_bit(buffer[slot].bitmap, off);
   buffer[slot].flag_modification = 1;
-  buffer[slot].PageTime          = time(nullptr);
+  buffer[slot].PageTime = time(nullptr);
 
   return true;
 }
